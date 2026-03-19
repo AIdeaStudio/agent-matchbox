@@ -38,6 +38,120 @@ class AdminMixin:
 
     # ==================== 平台管理 ====================
 
+    def _describe_secret_state(self, raw_value: Optional[str], *, audience: str = "generic") -> Dict[str, Any]:
+        text = raw_value.strip() if isinstance(raw_value, str) else ""
+        if not text:
+            return {
+                "status": "missing",
+                "configured": False,
+                "available": False,
+                "message": "未配置 API Key。",
+            }
+
+        result = SecurityManager.get_instance().decrypt(text)
+        if result.has_plaintext:
+            return {
+                "status": "ok",
+                "configured": True,
+                "available": True,
+                "message": "API Key 已配置并可用。",
+            }
+
+        if result.is_missing_key:
+            if audience == "system_managed":
+                return {
+                    "status": "missing_key",
+                    "configured": True,
+                    "available": False,
+                    "message": "检测到仓库同步或历史导入的托管密钥，但当前站点尚未设置主密钥 LLM_KEY。首次启动时这是正常现象，请站长先设置主密钥，再按需重新配置托管 API Key。",
+                }
+            return {
+                "status": "missing_key",
+                "configured": True,
+                "available": False,
+                "message": "检测到已保存的加密 API Key，但当前站点尚未设置主密钥 LLM_KEY。",
+            }
+
+        if audience == "system_managed":
+            return {
+                "status": "needs_reconfigure",
+                "configured": True,
+                "available": False,
+                "message": "检测到仓库同步或历史导入的托管密钥，但它无法被当前站点主密钥直接解开。首次拉取项目后这是常见现象，请站长在设置 LLM_KEY 后重新填写该平台的托管 API Key。",
+            }
+
+        if audience == "user_override":
+            return {
+                "status": "failed",
+                "configured": True,
+                "available": False,
+                "message": "已保存的用户 API Key 无法解密，可能是当前主密钥错误、历史密文来自其他环境，或数据已损坏。请重新配置该平台 API Key。",
+            }
+
+        return {
+            "status": "failed",
+            "configured": True,
+            "available": False,
+            "message": "已保存的 API Key 无法解密，可能是当前主密钥错误、历史密文来自其他环境，或数据已损坏。请重新配置。",
+        }
+
+    def _build_effective_key_view(
+        self,
+        *,
+        user_id: str,
+        user_key_saved: bool,
+        user_key_info: Optional[Dict[str, Any]],
+        sys_key_info: Optional[Dict[str, Any]],
+        api_key_available: bool,
+    ) -> Dict[str, str]:
+        can_use_sys_key = user_id == SYSTEM_USER_ID or self.llm_auto_key
+
+        if user_key_saved and user_key_info and user_key_info.get("available"):
+            return {
+                "status": "user_override",
+                "message": "当前使用您自己的 API Key。",
+            }
+
+        if user_key_saved and user_key_info and not user_key_info.get("available"):
+            if sys_key_info and sys_key_info.get("available") and can_use_sys_key and api_key_available:
+                return {
+                    "status": "managed_fallback",
+                    "message": f"{user_key_info.get('message')} 当前已自动回退到站长托管 API Key。",
+                }
+            return {
+                "status": "user_override_missing_key" if user_key_info.get("status") == "missing_key" else "user_override_failed",
+                "message": user_key_info.get("message") or "您保存的 API Key 当前不可用。",
+            }
+
+        if sys_key_info and sys_key_info.get("available") and can_use_sys_key and api_key_available:
+            return {
+                "status": "managed_ok",
+                "message": "当前使用站长托管 API Key。",
+            }
+
+        if sys_key_info and sys_key_info.get("available") and not can_use_sys_key:
+            return {
+                "status": "managed_available_but_locked",
+                "message": "站长已配置托管 API Key，但当前未开启对全体用户共享。请填写您自己的 API Key。",
+            }
+
+        if sys_key_info and sys_key_info.get("status") == "missing_key":
+            return {
+                "status": "managed_missing_key",
+                "message": sys_key_info.get("message") or "检测到托管密钥，但当前尚未设置主密钥。",
+            }
+
+        if sys_key_info and sys_key_info.get("status") == "needs_reconfigure":
+            return {
+                "status": "managed_needs_reconfigure",
+                "message": sys_key_info.get("message") or "托管密钥需要重新配置。",
+            }
+
+        return {
+            "status": "missing",
+            "message": "未配置任何可用 API Key。请设置您自己的 API Key，或联系站长配置托管密钥。",
+        }
+
     def add_platform(
         self,
         name: str,
@@ -58,15 +172,7 @@ class AdminMixin:
             api_key = SecurityManager.get_instance().encrypt(api_key)
         
         with self.Session() as session:
-            # 复活同名的已禁用自定义平台（避免重复建垃圾数据）
-            existing_same_name = session.query(LLMPlatform).filter_by(name=name, user_id=user_id, is_sys=0).first()
-            if existing_same_name and existing_same_name.disable:
-                existing_same_name.base_url = base_url
-                existing_same_name.api_key = api_key
-                existing_same_name.disable = 0
-                session.commit()
-                return existing_same_name
-
+            # 复活同 base_url 的已禁用自定义平台（避免重复建垃圾数据）
             existing_same_url = session.query(LLMPlatform).filter_by(base_url=base_url, user_id=user_id, is_sys=0).first()
             if existing_same_url and existing_same_url.disable:
                 existing_same_url.name = name
@@ -75,8 +181,8 @@ class AdminMixin:
                 session.commit()
                 return existing_same_url
 
-            # 平台名称全局唯一性检查
-            if name in DEFAULT_PLATFORM_CONFIGS or session.query(LLMPlatform).filter_by(name=name).first():
+            # 平台名称全局唯一性检查（仅检查未禁用的平台）
+            if name in DEFAULT_PLATFORM_CONFIGS or session.query(LLMPlatform).filter_by(name=name, disable=0).first():
                 raise ValueError(f"平台名称 '{name}' 已存在（系统预设或已被其他用户使用）")
             
             # 允许与系统平台 base_url 重复，但不允许与用户自己的其他自定义平台重复
@@ -136,6 +242,7 @@ class AdminMixin:
                 raise ValueError("平台名称与系统平台冲突")
             existing_name = session.query(LLMPlatform).filter(
                 LLMPlatform.name == new_name,
+                LLMPlatform.disable == 0,
                 LLMPlatform.id != platform_id
             ).first()
             if existing_name:
@@ -216,14 +323,21 @@ class AdminMixin:
             cred = user_sys_keys.get(plat.id)
             api_key = self._get_effective_api_key(session, user_id, plat)
             user_disable = cred.disable if cred else 0
-
-            # 展示站长本身是否有 key（与用户无关，用于前端展示托管状态）
-            sys_key_set = False
-            if plat.api_key:
-                try:
-                    sys_key_set = bool(SecurityManager.get_instance().decrypt(plat.api_key))
-                except Exception:
-                    pass
+            user_key_saved = bool(cred and cred.api_key)
+            user_key_info = self._describe_secret_state(cred.api_key, audience="user_override") if user_key_saved else {
+                "status": "missing",
+                "configured": False,
+                "available": False,
+                "message": "您尚未为该系统平台配置个人 API Key。",
+            }
+            sys_key_info = self._describe_secret_state(plat.api_key, audience="system_managed")
+            effective_key_view = self._build_effective_key_view(
+                user_id=user_id,
+                user_key_saved=user_key_saved,
+                user_key_info=user_key_info,
+                sys_key_info=sys_key_info,
+                api_key_available=bool(api_key),
+            )
 
             views.append(
                 {
@@ -231,11 +345,19 @@ class AdminMixin:
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "api_key_set": bool(api_key),
-                    "sys_key_set": sys_key_set,
+                    "api_key_status": effective_key_view["status"],
+                    "api_key_message": effective_key_view["message"],
+                    "sys_key_set": bool(sys_key_info["available"]),
+                    "sys_key_status": sys_key_info["status"],
+                    "sys_key_message": sys_key_info["message"],
                     "user_id": plat.user_id,
                     "is_sys": True,
-                    "user_key_override": bool(cred and cred.api_key),
+                    "user_key_override": bool(user_key_info["available"]),
+                    "user_key_saved": user_key_saved,
+                    "user_key_status": user_key_info["status"],
+                    "user_key_message": user_key_info["message"],
                     "disabled": int(bool(plat.disable) or bool(user_disable)),
+                    "sys_credit_price_per_million_tokens": plat.sys_credit_price_per_million_tokens,
                     "models": [m for m in plat.models if not self._is_model_disabled(m)],
                 }
             )
@@ -250,16 +372,21 @@ class AdminMixin:
 
         for plat in user_platforms:
             api_key = self._get_effective_api_key(session, user_id, plat)
+            key_info = self._describe_secret_state(plat.api_key, audience="custom")
             views.append(
                 {
                     "platform_id": plat.id,
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "api_key_set": bool(api_key),
+                    "api_key_status": "ok" if bool(api_key) else key_info["status"],
+                    "api_key_message": "当前平台 API Key 已配置并可用。" if bool(api_key) else key_info["message"],
                     "user_id": plat.user_id,
                     "is_sys": False,
                     "user_key_override": False,
+                    "user_key_saved": False,
                     "disabled": plat.disable,
+                    "sys_credit_price_per_million_tokens": None,
                     "models": [m for m in plat.models if not self._is_model_disabled(m)],
                 }
             )
@@ -277,9 +404,16 @@ class AdminMixin:
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "api_key_set": view["api_key_set"],
+                    "api_key_status": view.get("api_key_status", "missing"),
+                    "api_key_message": view.get("api_key_message", ""),
                     "sys_key_set": view.get("sys_key_set", False),
+                    "sys_key_status": view.get("sys_key_status", "missing"),
+                    "sys_key_message": view.get("sys_key_message", ""),
                     "is_sys": view["is_sys"],
                     "user_key_override": view.get("user_key_override", False),
+                    "user_key_saved": view.get("user_key_saved", False),
+                    "user_key_status": view.get("user_key_status", "missing"),
+                    "user_key_message": view.get("user_key_message", ""),
                     "disabled": view["disabled"],
                     "model_count": len(view["models"]),
                 }
@@ -303,16 +437,31 @@ class AdminMixin:
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "api_key_set": view["api_key_set"],
+                    "api_key_status": view.get("api_key_status", "missing"),
+                    "api_key_message": view.get("api_key_message", ""),
                     "sys_key_set": view.get("sys_key_set", False),
+                    "sys_key_status": view.get("sys_key_status", "missing"),
+                    "sys_key_message": view.get("sys_key_message", ""),
                     "is_sys": view["is_sys"],
                     "user_key_override": view.get("user_key_override", False),
+                    "user_key_saved": view.get("user_key_saved", False),
+                    "user_key_status": view.get("user_key_status", "missing"),
+                    "user_key_message": view.get("user_key_message", ""),
                     "disabled": view["disabled"],
+                    "sys_credit_price_per_million_tokens": view.get("sys_credit_price_per_million_tokens"),
                     "models": [
                         {
                             "model_id": m.id,
                             "model_name": m.model_name,
                             "display_name": m.display_name,
                             "extra_body": _parse_extra_body_for_response(m.extra_body),
+                            "temperature": m.temperature,
+                            "sys_credit_price_per_million_tokens": m.sys_credit_price_per_million_tokens,
+                            "resolved_sys_credit_price_per_million_tokens": (
+                                m.sys_credit_price_per_million_tokens
+                                if m.sys_credit_price_per_million_tokens is not None
+                                else view.get("sys_credit_price_per_million_tokens")
+                            ),
                         }
                         for m in view["models"]
                         if not m.is_embedding
@@ -332,8 +481,15 @@ class AdminMixin:
                     "platform_disabled": view["disabled"],
                     "base_url": view["base_url"],
                     "api_key_set": view["api_key_set"],
+                    "api_key_status": view.get("api_key_status", "missing"),
+                    "api_key_message": view.get("api_key_message", ""),
                     "sys_key_set": view.get("sys_key_set", False),
+                    "sys_key_status": view.get("sys_key_status", "missing"),
+                    "sys_key_message": view.get("sys_key_message", ""),
                     "user_key_override": view.get("user_key_override", False),
+                    "user_key_saved": view.get("user_key_saved", False),
+                    "user_key_status": view.get("user_key_status", "missing"),
+                    "user_key_message": view.get("user_key_message", ""),
                     "model_id": model.id,
                     "model_name": model.model_name,
                     "display_name": model.display_name,
@@ -362,8 +518,16 @@ class AdminMixin:
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "api_key_set": view["api_key_set"],
+                    "api_key_status": view.get("api_key_status", "missing"),
+                    "api_key_message": view.get("api_key_message", ""),
                     "is_sys": view["is_sys"],
                     "user_key_override": view.get("user_key_override", False),
+                    "user_key_saved": view.get("user_key_saved", False),
+                    "user_key_status": view.get("user_key_status", "missing"),
+                    "user_key_message": view.get("user_key_message", ""),
+                    "sys_key_set": view.get("sys_key_set", False),
+                    "sys_key_status": view.get("sys_key_status", "missing"),
+                    "sys_key_message": view.get("sys_key_message", ""),
                     "disabled": view["disabled"],
                     "embeddings": [
                         {
@@ -389,6 +553,7 @@ class AdminMixin:
         user_id: str = None,
         extra_body: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
+        sys_credit_price_per_million_tokens: Optional[int] = None,
         admin_mode: bool = False,
     ):
         """
@@ -406,8 +571,6 @@ class AdminMixin:
                 plat = session.query(LLMPlatform).filter_by(id=platform_id, is_sys=1).first()
                 if not plat:
                     raise ValueError("系统平台不存在")
-                # 检查显示名称在所有系统平台中唯一
-                scope_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
             else:
                 # 用户模式：操作自定义平台
                 if user_id is None or user_id == SYSTEM_USER_ID:
@@ -418,12 +581,10 @@ class AdminMixin:
                     raise ValueError("平台不存在、无权限或为不可修改的系统平台")
                 if self._is_platform_disabled(session, user_id, plat):
                     raise ValueError("平台已禁用")
-                # 检查显示名称在用户所有自定义平台中唯一
-                scope_platforms = session.query(LLMPlatform).filter_by(user_id=user_id, is_sys=0).all()
 
-            scope_platform_ids = [p.id for p in scope_platforms]
+            # 检查显示名称在当前平台下唯一（跨平台允许重复）
             existing_display = session.query(LLModels).filter(
-                LLModels.platform_id.in_(scope_platform_ids),
+                LLModels.platform_id == platform_id,
                 LLModels.display_name == display_name
             ).first()
             if existing_display:
@@ -434,6 +595,10 @@ class AdminMixin:
                     existing_display.is_embedding = 0
                     existing_display.extra_body = json.dumps(extra_body) if extra_body else None
                     existing_display.temperature = temperature
+                    if admin_mode:
+                        existing_display.sys_credit_price_per_million_tokens = (
+                            None if sys_credit_price_per_million_tokens is None else max(int(sys_credit_price_per_million_tokens), 0)
+                        )
                     self._set_model_disabled(existing_display, False)
                     session.commit()
                     if admin_mode:
@@ -451,6 +616,9 @@ class AdminMixin:
                 display_name=display_name,
                 extra_body=extra_body_json,
                 temperature=temperature,
+                sys_credit_price_per_million_tokens=(
+                    None if sys_credit_price_per_million_tokens is None else max(int(sys_credit_price_per_million_tokens), 0)
+                ),
                 is_embedding=0,
             )
             session.add(m)
@@ -487,7 +655,6 @@ class AdminMixin:
                 plat = session.query(LLMPlatform).filter_by(id=platform_id, is_sys=1).first()
                 if not plat:
                     raise ValueError("系统平台不存在")
-                scope_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
             else:
                 if user_id is None or user_id == SYSTEM_USER_ID:
                     raise ValueError("为 embedding 绑定真实 user_id")
@@ -497,11 +664,10 @@ class AdminMixin:
                     raise ValueError("平台不存在、无权限或为不可修改的系统平台")
                 if self._is_platform_disabled(session, user_id, plat):
                     raise ValueError("平台已禁用")
-                scope_platforms = session.query(LLMPlatform).filter_by(user_id=user_id, is_sys=0).all()
 
-            scope_platform_ids = [p.id for p in scope_platforms]
+            # 检查显示名称在当前平台下唯一（跨平台允许重复）
             existing_display = session.query(LLModels).filter(
-                LLModels.platform_id.in_(scope_platform_ids),
+                LLModels.platform_id == platform_id,
                 LLModels.display_name == display_name
             ).first()
             if existing_display:
@@ -547,6 +713,8 @@ class AdminMixin:
         new_display_name: Optional[str] = None,
         new_extra_body: Optional[Dict[str, Any]] = None,
         new_temperature: Optional[float] = None,
+        sys_credit_price_per_million_tokens: Optional[int] = None,
+        update_credit_price: bool = False,
         update_temperature: bool = False,
         user_id: str = None,
         admin_mode: bool = False,
@@ -567,22 +735,20 @@ class AdminMixin:
             if admin_mode:
                 if not plat or not plat.is_sys:
                     raise ValueError("此模型不属于系统平台")
-                scope_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
             else:
                 user_id = str(user_id) if user_id else None
                 if not plat or plat.is_sys or plat.user_id != user_id:
                     raise ValueError("无权修改此模型（系统模型或他人模型）")
                 if self._is_platform_disabled(session, user_id, plat):
                     raise ValueError("平台已禁用")
-                scope_platforms = session.query(LLMPlatform).filter_by(user_id=user_id, is_sys=0).all()
 
             if model.is_embedding:
                 raise ValueError("请使用 Embedding 管理接口修改该模型")
 
             if new_display_name is not None:
-                scope_platform_ids = [p.id for p in scope_platforms]
+                # 检查显示名称在当前平台下唯一（跨平台允许重复）
                 existing = session.query(LLModels).filter(
-                    LLModels.platform_id.in_(scope_platform_ids),
+                    LLModels.platform_id == model.platform_id,
                     LLModels.display_name == new_display_name,
                     LLModels.id != model_id
                 ).first()
@@ -595,6 +761,11 @@ class AdminMixin:
 
             if update_temperature:
                 model.temperature = new_temperature
+
+            if admin_mode and update_credit_price:
+                model.sys_credit_price_per_million_tokens = (
+                    None if sys_credit_price_per_million_tokens is None else max(int(sys_credit_price_per_million_tokens), 0)
+                )
 
             session.commit()
             
@@ -631,22 +802,20 @@ class AdminMixin:
             if admin_mode:
                 if not plat or not plat.is_sys:
                     raise ValueError("此模型不属于系统平台")
-                scope_platforms = session.query(LLMPlatform).filter_by(is_sys=1).all()
             else:
                 user_id = str(user_id) if user_id else None
                 if not plat or plat.is_sys or plat.user_id != user_id:
                     raise ValueError("无权修改此模型（系统模型或他人模型）")
                 if self._is_platform_disabled(session, user_id, plat):
                     raise ValueError("平台已禁用")
-                scope_platforms = session.query(LLMPlatform).filter_by(user_id=user_id, is_sys=0).all()
 
             if not model.is_embedding:
                 raise ValueError("目标模型不是 Embedding")
 
             if new_display_name is not None:
-                scope_platform_ids = [p.id for p in scope_platforms]
+                # 检查显示名称在当前平台下唯一（跨平台允许重复）
                 existing = session.query(LLModels).filter(
-                    LLModels.platform_id.in_(scope_platform_ids),
+                    LLModels.platform_id == model.platform_id,
                     LLModels.display_name == new_display_name,
                     LLModels.id != model_id
                 ).first()
@@ -749,16 +918,13 @@ class AdminMixin:
 
             for plat in platforms:
                 # 检查是否有 API Key
-                api_key_set = False
+                key_info = self._describe_secret_state(plat.api_key, audience="system_managed")
+                api_key_set = bool(key_info["available"])
                 api_key_raw = ""
                 if plat.api_key:
-                    try:
-                        decrypted = sec_mgr.decrypt(plat.api_key)
-                        if decrypted and not decrypted.startswith("ENC:"):
-                            api_key_set = True
-                            api_key_raw = decrypted
-                    except:
-                        pass
+                    decrypted = sec_mgr.decrypt(plat.api_key)
+                    if decrypted.has_plaintext:
+                        api_key_raw = decrypted.value
 
                 # 统计模型数量（仅启用的）
                 model_count = len([m for m in plat.models if not m.is_embedding and not self._is_model_disabled(m)])
@@ -769,6 +935,8 @@ class AdminMixin:
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "api_key_set": api_key_set,
+                    "api_key_status": key_info["status"],
+                    "api_key_message": key_info["message"],
                     "model_count": model_count,
                     "embedding_count": embedding_count,
                     "disabled": int(bool(plat.disable)),
@@ -807,6 +975,7 @@ class AdminMixin:
         name: str,
         base_url: str,
         api_key: Optional[str] = None,
+        sys_credit_price_per_million_tokens: Optional[int] = None,
     ) -> LLMPlatform:
         """
         添加系统平台（管理员专用）
@@ -818,19 +987,6 @@ class AdminMixin:
         base_url = normalize_base_url(base_url)
         
         with self.Session() as session:
-            existing_name_disabled = session.query(LLMPlatform).filter_by(name=name, is_sys=1).first()
-            if existing_name_disabled and existing_name_disabled.disable:
-                existing_name_disabled.base_url = base_url
-                existing_name_disabled.disable = 0
-                if api_key:
-                    existing_name_disabled.api_key = SecurityManager.get_instance().encrypt(api_key)
-                session.commit()
-
-                with self._cache_lock:
-                    self._sys_platforms_cache = None
-
-                return existing_name_disabled
-
             # 同 base_url 的系统平台若已存在且被禁用，则复活
             existing_url = session.query(LLMPlatform).filter_by(base_url=base_url, is_sys=1).first()
             if existing_url and existing_url.disable:
@@ -845,8 +1001,8 @@ class AdminMixin:
 
                 return existing_url
 
-            # 检查名称是否已存在
-            existing_name = session.query(LLMPlatform).filter_by(name=name).first()
+            # 检查名称是否已存在（仅检查未禁用的平台）
+            existing_name = session.query(LLMPlatform).filter_by(name=name, disable=0).first()
             if existing_name:
                 raise ValueError(f"平台名称 '{name}' 已存在")
             
@@ -866,6 +1022,9 @@ class AdminMixin:
                 api_key=encrypted_key,
                 user_id=SYSTEM_USER_ID,
                 is_sys=1,
+                sys_credit_price_per_million_tokens=(
+                    None if sys_credit_price_per_million_tokens is None else max(int(sys_credit_price_per_million_tokens), 0)
+                ),
             )
             session.add(plat)
             session.commit()
@@ -881,6 +1040,8 @@ class AdminMixin:
         platform_id: int,
         new_name: Optional[str] = None,
         new_base_url: Optional[str] = None,
+        sys_credit_price_per_million_tokens: Optional[int] = None,
+        update_credit_price: bool = False,
     ) -> bool:
         """
         更新系统平台信息（管理员专用）
@@ -891,9 +1052,10 @@ class AdminMixin:
                 raise ValueError("系统平台不存在")
             
             if new_name is not None:
-                # 检查名称唯一性
+                # 检查名称唯一性（仅检查未禁用的平台）
                 existing = session.query(LLMPlatform).filter(
                     LLMPlatform.name == new_name,
+                    LLMPlatform.disable == 0,
                     LLMPlatform.id != platform_id
                 ).first()
                 if existing:
@@ -911,7 +1073,12 @@ class AdminMixin:
                 if existing:
                     raise ValueError(f"已存在使用该 base_url 的系统平台: {existing.name}")
                 plat.base_url = new_base_url
-            
+
+            if update_credit_price:
+                plat.sys_credit_price_per_million_tokens = (
+                    None if sys_credit_price_per_million_tokens is None else max(int(sys_credit_price_per_million_tokens), 0)
+                )
+
             session.commit()
             
             # 刷新缓存

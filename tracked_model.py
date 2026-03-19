@@ -49,7 +49,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import sessionmaker
 
 from .models import UsageLogEntry
+from .credit_services import settle_usage_entry_credit
 from .estimate_tokens import estimate_tokens
+from .reasoning_compat import extract_reasoning_text_from_message, extract_text_content_from_message
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,7 @@ class UsageTrackingCallback(BaseCallbackHandler):
         platform_name: str,
         session_maker: sessionmaker,
         agent_name: Optional[str] = None,
+        quota_scope: Optional[str] = None,
     ):
         super().__init__()
         self.user_id = user_id
@@ -107,6 +110,7 @@ class UsageTrackingCallback(BaseCallbackHandler):
         self.model_name = model_name
         self.platform_name = platform_name
         self.agent_name = agent_name
+        self.quota_scope = quota_scope
         self._session_maker = session_maker
 
         # 流式累积缓冲区（按 run_id 隔离，支持并发）
@@ -164,28 +168,13 @@ class UsageTrackingCallback(BaseCallbackHandler):
                 # ChatGeneration
                 msg = getattr(gen, "message", None)
                 if msg is not None:
-                    content = getattr(msg, "content", "")
-                    if isinstance(content, str):
-                        parts.append(content)
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict):
-                                if block.get("type") == "text":
-                                    parts.append(block.get("text", ""))
-                                elif block.get("type") == "reasoning":
-                                    parts.append(block.get("reasoning", ""))
-                    # 尝试捕获附加的思考内容 (例如 DeepSeek 的 reasoning_content)
-                    kwargs_dict = getattr(msg, "additional_kwargs", {})
-                    if kwargs_dict:
-                        r_content = kwargs_dict.get("reasoning_content") or kwargs_dict.get("reasoning")
-                        if isinstance(r_content, dict) and "summary" in r_content:
-                            summary = r_content["summary"]
-                            if isinstance(summary, list):
-                                for item in summary:
-                                    if item.get("type") == "summary_text":
-                                        parts.append(item.get("text", ""))
-                        elif isinstance(r_content, str) and r_content:
-                            parts.append(r_content)
+                    visible_text = extract_text_content_from_message(msg)
+                    if visible_text:
+                        parts.append(visible_text)
+
+                    reasoning_text = extract_reasoning_text_from_message(msg)
+                    if reasoning_text:
+                        parts.append(reasoning_text)
                             
                     # tool_calls 也计入 completion
                     tool_calls = getattr(msg, "tool_calls", None)
@@ -220,8 +209,11 @@ class UsageTrackingCallback(BaseCallbackHandler):
                 total_tokens=total_tokens,
                 success=1 if success else 0,
                 agent_name=self.agent_name,
+                quota_scope=self.quota_scope,
             )
             session.add(entry)
+            session.flush()
+            settle_usage_entry_credit(session, entry)
             session.commit()
 
     async def _arecord_usage(
@@ -301,17 +293,7 @@ class UsageTrackingCallback(BaseCallbackHandler):
         
         if chunk and hasattr(chunk, "message"):
             msg = chunk.message
-            if hasattr(msg, "content") and isinstance(msg.content, list):
-                for block in msg.content:
-                    if isinstance(block, dict) and block.get("type") == "reasoning":
-                        val = block.get("reasoning", "")
-                        if val:
-                            reasoning_text += val
-            
-            if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
-                r_content = msg.additional_kwargs.get("reasoning_content") or msg.additional_kwargs.get("reasoning")
-                if isinstance(r_content, str) and r_content:
-                    reasoning_text += r_content
+            reasoning_text = extract_reasoning_text_from_message(msg)
 
         if reasoning_text:
             self._stream_buffers[run_key].append(reasoning_text)
@@ -394,17 +376,7 @@ class UsageTrackingCallback(BaseCallbackHandler):
         
         if chunk and hasattr(chunk, "message"):
             msg = chunk.message
-            if hasattr(msg, "content") and isinstance(msg.content, list):
-                for block in msg.content:
-                    if isinstance(block, dict) and block.get("type") == "reasoning":
-                        val = block.get("reasoning", "")
-                        if val:
-                            reasoning_text += val
-            
-            if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
-                r_content = msg.additional_kwargs.get("reasoning_content") or msg.additional_kwargs.get("reasoning")
-                if isinstance(r_content, str) and r_content:
-                    reasoning_text += r_content
+            reasoning_text = extract_reasoning_text_from_message(msg)
 
         if reasoning_text:
             self._stream_buffers[run_key].append(reasoning_text)
@@ -453,6 +425,7 @@ class LLMUsage:
         platform_name: str,
         session_maker: sessionmaker,
         agent_name: Optional[str] = None,
+        quota_scope: Optional[str] = None,
     ):
         self.user_id = user_id
         self.model_id = model_id
@@ -460,6 +433,7 @@ class LLMUsage:
         self.model_name = model_name
         self.platform_name = platform_name
         self.agent_name = agent_name
+        self.quota_scope = quota_scope
         self._session_maker = session_maker
 
     def get_usage_last_24h(self) -> Dict[str, Any]:
@@ -478,10 +452,27 @@ class LLMUsage:
         """获取所有时间的总用量"""
         return self._get_usage_since(None)
 
+    def get_sys_paid_usage_last_24h(self) -> Dict[str, Any]:
+        """获取过去 24 小时内消耗站长额度的用量"""
+        return self._get_usage_since(timedelta(hours=24), quota_scope="sys_paid")
+
+    def get_self_paid_usage_last_24h(self) -> Dict[str, Any]:
+        """获取过去 24 小时内消耗用户自有密钥的用量"""
+        return self._get_usage_since(timedelta(hours=24), quota_scope="self_paid")
+
+    def get_sys_paid_usage_total(self) -> Dict[str, Any]:
+        """获取所有时间内消耗站长额度的用量"""
+        return self._get_usage_since(None, quota_scope="sys_paid")
+
+    def get_self_paid_usage_total(self) -> Dict[str, Any]:
+        """获取所有时间内消耗用户自有密钥的用量"""
+        return self._get_usage_since(None, quota_scope="self_paid")
+
     def get_usage_by_range(
         self,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
+        quota_scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """获取指定时间范围的用量"""
         with self._session_maker() as session:
@@ -499,10 +490,12 @@ class LLMUsage:
                 query = query.filter(UsageLogEntry.created_at >= start_time)
             if end_time is not None:
                 query = query.filter(UsageLogEntry.created_at <= end_time)
+            if quota_scope is not None:
+                query = query.filter(UsageLogEntry.quota_scope == quota_scope)
             result = query.first()
             return self._format_result(result)
 
-    def _get_usage_since(self, delta: Optional[timedelta]) -> Dict[str, Any]:
+    def _get_usage_since(self, delta: Optional[timedelta], quota_scope: Optional[str] = None) -> Dict[str, Any]:
         """内部方法：查询指定时间范围的用量"""
         with self._session_maker() as session:
             query = session.query(
@@ -518,6 +511,8 @@ class LLMUsage:
             if delta is not None:
                 cutoff = datetime.now(UTC) - delta
                 query = query.filter(UsageLogEntry.created_at >= cutoff)
+            if quota_scope is not None:
+                query = query.filter(UsageLogEntry.quota_scope == quota_scope)
             result = query.first()
             return self._format_result(result)
 

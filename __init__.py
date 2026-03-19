@@ -33,6 +33,8 @@ from .config import (
 from .utils import probe_platform_models
 from .manager import AIManager
 from .tracked_model import LLMUsage, LLMClient
+from .credit_services import CreditBalanceExceededError
+from .quota_services import QuotaExceededError
 
 
 def _should_init_manager() -> bool:
@@ -54,6 +56,8 @@ __all__ = [
     'AIManager',
     'LLMClient',
     'LLMUsage',
+    'CreditBalanceExceededError',
+    'QuotaExceededError',
     'SecurityManager',
     'get_decrypted_api_key',
     'probe_platform_models',
